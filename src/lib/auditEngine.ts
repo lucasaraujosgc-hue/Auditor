@@ -210,6 +210,84 @@ function parseAmount(val: any): number {
   return isNaN(num) ? 0 : num;
 }
 
+// =============================================================================
+// Agrupamento de contas (compartilhado entre runDeterministicAudit e runBalanceteAudit)
+// =============================================================================
+
+/**
+ * Deriva o "grupo contábil" de uma conta a partir da sua classificação (prefixo
+ * do plano de contas, padrão SPED) e, quando necessário, de sua descrição —
+ * usado para identificar Provisões, que podem estar em qualquer subnível do
+ * Passivo e não seguem um prefixo padronizado de forma confiável.
+ */
+export function getAccountGroup(classification: string, description?: string): string {
+  const cls = (classification || '').trim();
+  const desc = (description || '').toLowerCase();
+
+  // Provisões (férias, 13º, contingências) — identificadas pelo nome primeiro,
+  // pois o prefixo de classificação varia muito entre planos de contas.
+  if (cls.startsWith('2.') && /provis/.test(desc)) return 'Provisão';
+
+  if (cls.startsWith('1.1.1')) return 'Ativo Financeiro';
+  if (cls.startsWith('1.1.')) return 'Ativo Operacional';
+  if (cls.startsWith('1.')) return 'Ativo Não Circulante';
+
+  if (cls.startsWith('2.1.')) return 'Passivo Circulante';
+  if (cls.startsWith('2.3.') || cls.startsWith('2.9.')) return 'Patrimônio Líquido';
+  if (cls.startsWith('2.')) return 'Passivo Não Circulante';
+
+  if (cls.startsWith('3.1.') || (cls.startsWith('3.') && !cls.match(/^3\.[2-9]/))) return 'Receita';
+  if (cls.startsWith('3.2.') || cls.startsWith('4.1.')) return 'Custo';
+  if (cls.startsWith('3.') || cls.startsWith('4.')) return 'Despesa';
+
+  return 'Outro';
+}
+
+/** Grupos cuja natureza contábil normal é devedora. */
+export const DEBTOR_NATURE_GROUPS = new Set([
+  'Ativo Financeiro', 'Ativo Operacional', 'Ativo Não Circulante', 'Custo', 'Despesa'
+]);
+
+/** Grupos cuja natureza contábil normal é credora. */
+export const CREDITOR_NATURE_GROUPS = new Set([
+  'Passivo Circulante', 'Passivo Não Circulante', 'Patrimônio Líquido', 'Receita', 'Provisão'
+]);
+
+/**
+ * Calcula o "saldo com sinal de natureza" de um lançamento de balancete: um
+ * valor positivo indica que a conta está no lado esperado (devedora ou
+ * credora, conforme seu grupo contábil); um valor negativo indica inversão de
+ * saldo. Contas redutoras (ex: Depreciação Acumulada, que reside no Ativo mas
+ * tem natureza credora) devem ser calculadas com `forceCreditorNature = true`.
+ */
+export function computeNaturalBalance(
+  entry: Pick<LedgerEntry, 'previousBalance' | 'debit' | 'credit'>,
+  group: string,
+  forceCreditorNature = false
+): number {
+  const isDebtor = !forceCreditorNature && DEBTOR_NATURE_GROUPS.has(group);
+  return isDebtor
+    ? entry.previousBalance + entry.debit - entry.credit
+    : entry.previousBalance + entry.credit - entry.debit;
+}
+
+/** Distância de Levenshtein simples — usada para detectar contas com nomes quase idênticos. */
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[m][n];
+}
+
 const extractKeys = (history: string) => {
   const keys: string[] = [];
   if (!history) return keys;
@@ -767,5 +845,3 @@ Retorne um JSON com os achados:
   
   return aiFindings;
 }
-
-
