@@ -693,6 +693,8 @@ Você é um contador sênior brasileiro, especialista em Lucro Presumido e regra
 Temos uma lista de lançamentos de Origem (sem contrapartida) e uma lista de lançamentos de Destino Esperado (também sem contrapartida).
 Tente parear os lançamentos da Origem com o Destino Esperado, mesmo que os históricos tenham palavras diferentes (ex: "venda balcão" e "depósito dinheiro"), usando seu julgamento textual, valores compatíveis e datas próximas.
 
+Dê atenção especial às contas analíticas de resultado e à conciliação com as contas de disponibilidade (bancos). Quando identificar que um lançamento em conta de resultado (Custo/Despesa/Receita) tem um número de Nota Fiscal (NF) e o parear com um lançamento de pagamento/recebimento no banco cujo histórico está genérico, a sua sugestão de ajuste deve recomendar explicitamente a alteração do histórico da conta banco para incluir o número da respectiva Nota Fiscal.
+
 Lançamentos Origem:
 ${JSON.stringify(sources.map(e => ({ id: e.id, data: e.date, conta: e.accountCode, historico: e.history, valor: e.debit || e.credit })), null, 2)}
 
@@ -702,18 +704,18 @@ ${JSON.stringify(targets.map(e => ({ id: e.id, data: e.date, conta: e.accountCod
 Retorne um JSON com a seguinte estrutura:
 {
   "matchedPairs": [
-    { "entryIdA": 123, "entryIdB": 456, "confidence": "alta"|"media"|"baixa", "reasoning": "string" }
+    { "entryIdA": 123, "entryIdB": 456, "confidence": "alta"|"media"|"baixa", "reasoning": "string", "suggestedBankHistoryAdjustment": "novo histórico sugerido com a NF para a conta banco" }
   ],
   "stillUnmatched": [
     { 
       "entryId": 123, 
       "reason": "motivo pelo qual não encontrou par",
       "suggestedAdjustment": {
-        "debitAccountCode": "código da conta débito",
-        "creditAccountCode": "código da conta crédito",
+        "debitAccountCode": "código analítico da conta débito",
+        "creditAccountCode": "código analítico da conta crédito",
         "amount": 100.00,
-        "history": "histórico sugerido",
-        "reason": "motivo do ajuste"
+        "history": "histórico sugerido detalhado",
+        "reason": "motivo do ajuste e indicação de onde debitar/creditar"
       }
     }
   ]
@@ -733,9 +735,10 @@ Nota: "stillUnmatched" deve conter os IDs da Origem que NÃO conseguiram par.
              
              if (data.matchedPairs) {
                  for (const pair of data.matchedPairs) {
+                     const src = sources.find(s => s.id === pair.entryIdA);
+                     const tgt = targets.find(t => t.id === pair.entryIdB);
+                     
                      if (pair.confidence === 'baixa') {
-                         const src = sources.find(s => s.id === pair.entryIdA);
-                         const tgt = targets.find(t => t.id === pair.entryIdB);
                          if (src && tgt) {
                              aiFindings.push({
                                  companyId,
@@ -749,6 +752,20 @@ Nota: "stillUnmatched" deve conter os IDs da Origem que NÃO conseguiram par.
                                  resolved: false
                              });
                          }
+                     }
+                     
+                     if (pair.suggestedBankHistoryAdjustment && src && tgt) {
+                          aiFindings.push({
+                               companyId,
+                               period,
+                               severity: 'observation',
+                               category: 'Sugestão de Ajuste de Histórico (NF)',
+                               accountsInvolved: [src.accountCode, tgt.accountCode],
+                               description: `A IA encontrou o par correspondente e sugere detalhar o histórico na conta banco (disponibilidade) com o número da Nota Fiscal.\nMotivo: ${pair.reasoning}\nSugestão de Histórico Banco: ${pair.suggestedBankHistoryAdjustment}`,
+                               historyExtract: `Origem: ${src.history}\nDestino (Banco): ${tgt.history}`,
+                               relatedEntryIds: [src.id as number, tgt.id as number],
+                               resolved: false
+                          });
                      }
                  }
              }
