@@ -14,6 +14,7 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
   const [progressText, setProgressText] = useState('');
   const [findings, setFindings] = useState<AuditFinding[]>([]);
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [relatedEntries, setRelatedEntries] = useState<LedgerEntry[]>([]);
 
   useEffect(() => {
     loadPeriods();
@@ -86,13 +87,13 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
         .and(f => f.period === period)
         .delete();
         
-      const deterministicFindings = await runDeterministicAudit(companyId, period);
+      const { findings: deterministicFindings, unmatchedPool } = await runDeterministicAudit(companyId, period);
       if (deterministicFindings.length > 0) {
         await db.auditFindings.bulkAdd(deterministicFindings);
       }
       
       setProgressText('Enviando pendências para análise da IA...');
-      const aiFindings = await runAIAudit(companyId, period, deterministicFindings);
+      const aiFindings = await runAIAudit(companyId, period, unmatchedPool, setProgressText);
       if (aiFindings.length > 0) {
         await db.auditFindings.bulkAdd(aiFindings);
       }
@@ -111,6 +112,21 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
   const markResolved = async (id: number, resolved: boolean) => {
     await db.auditFindings.update(id, { resolved });
     await loadFindings();
+  };
+  
+  const handleExpand = async (finding: AuditFinding) => {
+    if (expandedId === finding.id) {
+       setExpandedId(null);
+       setRelatedEntries([]);
+    } else {
+       setExpandedId(finding.id as number);
+       if (finding.relatedEntryIds && finding.relatedEntryIds.length > 0) {
+          const entries = await db.ledgerEntries.where('id').anyOf(finding.relatedEntryIds).toArray();
+          setRelatedEntries(entries);
+       } else {
+          setRelatedEntries([]);
+       }
+    }
   };
 
   const handleExportReport = () => {
@@ -169,7 +185,7 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
       <Card key={finding.id} className={`mb-4 ${borderColor} ${finding.resolved ? 'opacity-60 bg-gray-50' : ''}`}>
         <div 
           className="p-4 flex items-start justify-between cursor-pointer hover:bg-gray-50/50 transition-colors"
-          onClick={() => setExpandedId(isExpanded ? null : finding.id as number)}
+          onClick={() => handleExpand(finding)}
         >
           <div className="flex gap-4 items-start">
             <div className="mt-1">{icon}</div>
@@ -209,10 +225,29 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
         
         {isExpanded && (
           <div className="px-4 pb-4 pt-2 border-t border-gray-100 bg-gray-50">
-            {finding.historyExtract && (
+            {relatedEntries.length > 1 ? (
+              <div className="mb-4">
+                <h5 className="text-xs font-semibold text-gray-500 uppercase mb-2">Lançamentos Envolvidos</h5>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {relatedEntries.map((re, idx) => (
+                    <div key={re.id} className="bg-white p-3 rounded border text-sm">
+                      <div className="font-semibold mb-1 text-gray-800">Lançamento {idx === 0 ? 'A (Origem)' : 'B (Destino)'}</div>
+                      <div className="grid grid-cols-2 gap-x-2 text-xs">
+                        <span className="text-gray-500">Conta:</span> <span className="font-mono">{re.accountCode}</span>
+                        <span className="text-gray-500">Data:</span> <span>{re.date}</span>
+                        <span className="text-gray-500">Valor:</span> <span>R$ {Math.max(re.debit, re.credit).toFixed(2)}</span>
+                      </div>
+                      <div className="mt-2 text-gray-700 font-mono text-xs p-2 bg-gray-50 rounded">
+                        {re.history}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : finding.historyExtract && (
               <div className="mb-4">
                 <h5 className="text-xs font-semibold text-gray-500 uppercase mb-2">Trecho do Histórico Analisado</h5>
-                <div className="bg-white p-3 rounded border text-sm font-mono text-gray-700">
+                <div className="bg-white p-3 rounded border text-sm font-mono text-gray-700 whitespace-pre-wrap">
                   {finding.historyExtract}
                 </div>
               </div>
@@ -363,3 +398,4 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
     </div>
   );
 }
+

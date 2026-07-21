@@ -1,5 +1,5 @@
 import { db, type LedgerEntry, type AuditFinding, type Account } from './db';
-import { GoogleGenAI, Type, Schema } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
 
 export async function parseLedgerData(
   companyId: number,
@@ -101,13 +101,33 @@ function parseAmount(val: any): number {
   return isNaN(num) ? 0 : num;
 }
 
-export async function runDeterministicAudit(companyId: number, period: string): Promise<AuditFinding[]> {
+const extractKeys = (history: string) => {
+  const keys: string[] = [];
+  if (!history) return keys;
+  
+  // NF
+  const nfMatch = history.match(/(?:NF|NOTA FISCAL)[-\s]*(\d+)/i);
+  if (nfMatch) keys.push(`NF-${nfMatch[1]}`);
+  
+  // Sequence of numbers > 5 digits
+  const numMatch = history.match(/\b\d{5,}\b/g);
+  if (numMatch) keys.push(...numMatch);
+  
+  // Uppercase sequences (names)
+  const nameMatch = history.match(/\b[A-Z]{3,}(?:\s+[A-Z]{3,})*\b/g);
+  if (nameMatch) {
+    keys.push(...nameMatch.filter(n => n.length > 5));
+  }
+  
+  return keys;
+};
+
+export async function runDeterministicAudit(companyId: number, period: string): Promise<{ findings: AuditFinding[], unmatchedPool: any }> {
   const findings: AuditFinding[] = [];
   
   // Load data
   const accounts = await db.accounts.where('companyId').equals(companyId).toArray();
   const physicalAccounts = accounts.filter(a => a.isPhysicalAccount);
-  const physicalAccountCodes = physicalAccounts.map(a => a.code);
   
   const entries = await db.ledgerEntries
     .where('companyId').equals(companyId)
@@ -124,14 +144,11 @@ export async function runDeterministicAudit(companyId: number, period: string): 
       
     if (accEntries.length === 0) continue;
     
-    // Attempt to find initial balance from balancete or first entry
     let runningBalance = accEntries[0].previousBalance || 0;
-    
     let lowestBalance = runningBalance;
     let lowestDate = '';
     
     for (const entry of accEntries) {
-      // Assuming Caixa is Debit nature (Active)
       runningBalance += (entry.debit - entry.credit);
       if (runningBalance < lowestBalance) {
         lowestBalance = runningBalance;
@@ -151,66 +168,151 @@ export async function runDeterministicAudit(companyId: number, period: string): 
       });
     }
     
-    // 3. Block entry detection
-    if (accEntries.length === 1 && Math.abs(accEntries[0].debit - accEntries[0].credit) > 1000) {
-       findings.push({
-         companyId,
-         period,
-         severity: 'moderate',
-         category: 'Lançamento em Bloco',
-         accountsInvolved: [acc.code],
-         description: `Identificado um único lançamento grande no mês para a conta ${acc.code} (${acc.description}). Valor: R$ ${Math.abs(accEntries[0].debit - accEntries[0].credit).toFixed(2)}.`,
-         historyExtract: accEntries[0].history,
-         relatedEntryIds: [accEntries[0].id as number],
-         resolved: false
-       });
+    // 3. Block entry detection (Cross-reference single large entry with sum of related opposite entries)
+    if (accEntries.length > 1) {
+       const debits = accEntries.filter(e => e.debit > 0);
+       const credits = accEntries.filter(e => e.credit > 0);
+       
+       const checkBlock = (singles: LedgerEntry[], multiples: LedgerEntry[], isDebitSingle: boolean) => {
+           if (singles.length === 1 && multiples.length > 1) {
+               const single = singles[0];
+               const singleAmount = isDebitSingle ? single.debit : single.credit;
+               const sumOpposite = multiples.reduce((sum, e) => sum + (isDebitSingle ? e.credit : e.debit), 0);
+               
+               if (sumOpposite > 0 && Math.abs(singleAmount - sumOpposite) / sumOpposite <= 0.02) {
+                   // Related accounts check
+                   const relatedEntries = razaoEntries.filter(e => e.accountCode.startsWith('1.1') && e.accountCode !== acc.code);
+                   const sumRelated = relatedEntries.reduce((sum, e) => sum + (isDebitSingle ? e.credit : e.debit), 0);
+                   
+                   // Se bate internamente ou com conta relacionada
+                   if (Math.abs(singleAmount - sumRelated) / sumRelated <= 0.02 || true) { // Always flag internal imbalance blocks
+                       findings.push({
+                         companyId,
+                         period,
+                         severity: 'moderate',
+                         category: 'Lançamento em Bloco Retroativo',
+                         accountsInvolved: [acc.code],
+                         description: `Identificado um único lançamento consolidado grande no mês para a conta ${acc.code} (${acc.description}) que bate com a soma de dezenas de contrapartidas. Valor: R$ ${singleAmount.toFixed(2)}.`,
+                         historyExtract: single.history,
+                         relatedEntryIds: [single.id as number, ...multiples.map(e => e.id as number)],
+                         resolved: false
+                       });
+                   }
+               }
+           }
+       };
+       checkBlock(debits, credits, true);
+       checkBlock(credits, debits, false);
     }
   }
 
-  // 4. Extração de chaves do histórico e Cruzamento (NF / Cliente)
-  const extractKey = (history: string) => {
-    const nfMatch = history.match(/(?:NF|NOTA FISCAL)[-\s]*(\d+)/i);
-    if (nfMatch) return `NF-${nfMatch[1]}`;
-    return null;
-  };
+  // Chain categorization
+  const receitaCodes = new Set(accounts.filter(a => a.classification.startsWith('3.')).map(a => a.code));
+  const clienteCodes = new Set(accounts.filter(a => a.description.toLowerCase().includes('cliente') && a.classification.startsWith('1.')).map(a => a.code));
+  const caixaCodes = new Set(accounts.filter(a => a.description.toLowerCase().includes('caixa') && a.classification.startsWith('1.1.')).map(a => a.code));
+  const bancoCodes = new Set(accounts.filter(a => a.description.toLowerCase().includes('banco') && a.classification.startsWith('1.1.')).map(a => a.code));
   
-  const receitaEntries = razaoEntries.filter(e => e.accountCode.startsWith('3.'));
-  const clienteEntries = razaoEntries.filter(e => e.accountDescription.toLowerCase().includes('cliente') && e.accountCode.startsWith('1.'));
-  
-  for (const receita of receitaEntries) {
-    if (!receita.history) continue;
-    const key = extractKey(receita.history);
-    if (key) {
-      // Procura contrapartida em clientes
-      const match = clienteEntries.find(c => 
-        c.history && extractKey(c.history) === key && 
-        Math.abs(c.debit - receita.credit) < 0.01 // Receita é crédito, Cliente é débito
-      );
+  const entriesReceita = razaoEntries.filter(e => receitaCodes.has(e.accountCode));
+  const entriesCliente = razaoEntries.filter(e => clienteCodes.has(e.accountCode));
+  const entriesCaixa = razaoEntries.filter(e => caixaCodes.has(e.accountCode));
+  const entriesBanco = razaoEntries.filter(e => bancoCodes.has(e.accountCode));
+
+  const matchEntries = (
+    sources: LedgerEntry[], 
+    targets: LedgerEntry[], 
+    allEntries: LedgerEntry[], 
+    expectedTargetCodes: Set<string>,
+    sourceName: string,
+    targetName: string
+  ) => {
+    const matchedSourceIds = new Set<number>();
+    const matchedTargetIds = new Set<number>();
+    
+    for (const source of sources) {
+      if (!source.id) continue;
+      const keys = extractKeys(source.history || '');
       
-      if (!match) {
+      // 1. Try to find in expected targets
+      const targetMatch = targets.find(t => {
+        if (!t.id || matchedTargetIds.has(t.id)) return false;
+        if (Math.abs((source.credit || source.debit) - (t.debit || t.credit)) > 0.01) return false;
+        
+        const tKeys = extractKeys(t.history || '');
+        if (keys.length > 0 && keys.some(k => tKeys.includes(k))) return true;
+        
+        if (source.date && t.date) {
+           const ds = new Date(source.date).getTime();
+           const dt = new Date(t.date).getTime();
+           if (Math.abs(ds - dt) <= 5 * 24 * 3600 * 1000) return true;
+        }
+        return false;
+      });
+      
+      if (targetMatch) {
+        matchedSourceIds.add(source.id);
+        matchedTargetIds.add(targetMatch.id as number);
+        continue;
+      }
+      
+      // 2. Try to find in WRONG targets
+      const wrongMatch = allEntries.find(t => {
+        if (!t.id || matchedTargetIds.has(t.id) || t.accountCode === source.accountCode) return false;
+        if (expectedTargetCodes.has(t.accountCode)) return false;
+        
+        if (Math.abs((source.credit || source.debit) - (t.debit || t.credit)) > 0.01) return false;
+        
+        const tKeys = extractKeys(t.history || '');
+        if (keys.length > 0 && keys.some(k => tKeys.includes(k))) return true;
+        
+        if (source.date && t.date && source.date === t.date) return true;
+        
+        return false;
+      });
+      
+      if (wrongMatch) {
+        matchedSourceIds.add(source.id);
+        matchedTargetIds.add(wrongMatch.id as number);
         findings.push({
-          companyId,
-          period,
-          severity: 'moderate',
-          category: 'Possível Lançamento Faltante ou em Conta Errada',
-          accountsInvolved: [receita.accountCode],
-          description: `Receita reconhecida com chave ${key}, mas não foi encontrada a contrapartida esperada em Clientes a Receber pelo mesmo valor (R$ ${receita.credit.toFixed(2)}).`,
-          historyExtract: receita.history,
-          resolved: false
+           companyId: source.companyId,
+           period: source.period,
+           severity: 'moderate',
+           category: 'Lançamento em Conta Errada',
+           accountsInvolved: [source.accountCode, wrongMatch.accountCode],
+           description: `Lançamento originado em ${sourceName} possui contrapartida registrada na conta incorreta ${wrongMatch.accountCode} (${wrongMatch.accountDescription}). Esperado: grupo ${targetName}.`,
+           historyExtract: `Origem: ${source.history}\nDestino Encontrado: ${wrongMatch.history}`,
+           relatedEntryIds: [source.id, wrongMatch.id as number],
+           resolved: false
         });
       }
     }
-  }
+    
+    return { 
+      matchedTargetIds,
+      unmatchedSources: sources.filter(s => s.id && !matchedSourceIds.has(s.id)),
+      unmatchedTargets: targets.filter(t => t.id && !matchedTargetIds.has(t.id))
+    };
+  };
+
+  const expectedClienteCodes = clienteCodes;
+  const expectedCaixaBancoCodes = new Set([...caixaCodes, ...bancoCodes]);
+  const expectedBancoCodes = bancoCodes;
+
+  const res1 = matchEntries(entriesReceita.filter(e => e.credit > 0), entriesCliente.filter(e => e.debit > 0), razaoEntries.filter(e => e.debit > 0), expectedClienteCodes, 'Receita', 'Clientes a Receber');
+  const res2 = matchEntries(entriesCliente.filter(e => e.credit > 0), [...entriesCaixa.filter(e => e.debit > 0), ...entriesBanco.filter(e => e.debit > 0)], razaoEntries.filter(e => e.debit > 0), expectedCaixaBancoCodes, 'Clientes a Receber', 'Caixa ou Banco');
+  const res3 = matchEntries(entriesCaixa.filter(e => e.credit > 0), entriesBanco.filter(e => e.debit > 0), razaoEntries.filter(e => e.debit > 0), expectedBancoCodes, 'Caixa', 'Banco');
+
+  const unmatchedPool = {
+      receitaCliente: { sources: res1.unmatchedSources, targets: res1.unmatchedTargets },
+      clienteCaixaBanco: { sources: res2.unmatchedSources, targets: res2.unmatchedTargets },
+      caixaBanco: { sources: res3.unmatchedSources, targets: res3.unmatchedTargets }
+  };
 
   // 6. Pente fino Resultado x Realização Financeira
   const balanceteEntries = entries.filter(e => e.source === 'balancete');
   const totalReceita = balanceteEntries.filter(e => e.accountCode.startsWith('3.')).reduce((acc, e) => acc + e.credit - e.debit, 0);
   
   const totalCaixaBancoIn = razaoEntries
-    .filter(e => {
-       const desc = e.accountDescription.toLowerCase();
-       return (desc.includes('caixa') || desc.includes('banco')) && e.accountCode.startsWith('1.');
-    })
+    .filter(e => e.debit > 0 && (caixaCodes.has(e.accountCode) || bancoCodes.has(e.accountCode)))
     .reduce((acc, e) => acc + e.debit, 0);
     
   if (totalReceita > 0 && totalCaixaBancoIn < totalReceita * 0.1) {
@@ -225,7 +327,7 @@ export async function runDeterministicAudit(companyId: number, period: string): 
     });
   }
   
-  // 7. Comparação mês a mês (se houver período anterior)
+  // 7. Comparação mês a mês
   const allPeriods = Array.from(new Set(
     (await db.ledgerEntries.where('companyId').equals(companyId).toArray()).map(e => e.period)
   )).sort();
@@ -257,85 +359,143 @@ export async function runDeterministicAudit(companyId: number, period: string): 
     }
   }
   
-  return findings;
+  return { findings, unmatchedPool };
 }
 
-export async function runAIAudit(companyId: number, period: string, deterministicFindings: AuditFinding[]): Promise<AuditFinding[]> {
+export async function runAIAudit(
+  companyId: number, 
+  period: string, 
+  unmatchedPool: any, 
+  onProgress?: (msg: string) => void
+): Promise<AuditFinding[]> {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return [];
+  const aiFindings: AuditFinding[] = [];
+  
+  const generateMissingFinding = (source: LedgerEntry, expectedSide: string): AuditFinding => ({
+     companyId,
+     period,
+     severity: 'moderate',
+     category: 'Lançamento Faltante',
+     accountsInvolved: [source.accountCode],
+     description: `Lançamento de R$ ${(source.debit || source.credit).toFixed(2)} na conta ${source.accountCode} (${source.accountDescription}) não encontrou contrapartida em ${expectedSide}.`,
+     historyExtract: source.history,
+     relatedEntryIds: [source.id as number],
+     resolved: false
+  });
+
+  if (!apiKey) {
+     for (const src of unmatchedPool.receitaCliente.sources) aiFindings.push(generateMissingFinding(src, 'Clientes a Receber'));
+     for (const src of unmatchedPool.clienteCaixaBanco.sources) aiFindings.push(generateMissingFinding(src, 'Caixa ou Banco'));
+     for (const src of unmatchedPool.caixaBanco.sources) aiFindings.push(generateMissingFinding(src, 'Banco'));
+     return aiFindings;
+  }
   
   const ai = new GoogleGenAI({ apiKey });
   
-  const entries = await db.ledgerEntries
-    .where('companyId').equals(companyId)
-    .and(e => e.period === period && e.source === 'razao')
-    .toArray();
-    
-  if (entries.length === 0) return [];
-  
-  // Only send a subset (e.g. large entries or entries lacking match) to avoid token limit
-  const subset = entries.filter(e => e.debit > 1000 || e.credit > 1000).slice(0, 50); 
-  
-  if (subset.length === 0) return [];
-  
-  const prompt = `
+  const processChain = async (chainName: string, sources: LedgerEntry[], targets: LedgerEntry[], expectedTargetName: string) => {
+      if (sources.length === 0) return;
+      if (targets.length === 0) {
+          for (const src of sources) aiFindings.push(generateMissingFinding(src, expectedTargetName));
+          return;
+      }
+      
+      onProgress?.(`Analisando elo: ${chainName} (${sources.length} pendências)...`);
+      
+      const prompt = `
 Você é um contador sênior brasileiro, especialista em Lucro Presumido e regras do SPED.
-Analise os seguintes lançamentos contábeis extraídos do Razão. Identifique possíveis anomalias,
-falta de contrapartidas lógicas, ou erros de classificação com base no histórico.
+Temos uma lista de lançamentos de Origem (sem contrapartida) e uma lista de lançamentos de Destino Esperado (também sem contrapartida).
+Tente parear os lançamentos da Origem com o Destino Esperado, mesmo que os históricos tenham palavras diferentes (ex: "venda balcão" e "depósito dinheiro"), usando seu julgamento textual, valores compatíveis e datas próximas.
 
-Lançamentos:
-${JSON.stringify(subset.map(e => ({ id: e.id, data: e.date, conta: e.accountCode, historico: e.history, debito: e.debit, credito: e.credit })), null, 2)}
+Lançamentos Origem:
+${JSON.stringify(sources.map(e => ({ id: e.id, data: e.date, conta: e.accountCode, historico: e.history, valor: e.debit || e.credit })), null, 2)}
 
-Retorne um JSON com os achados (findings). Estrutura:
+Lançamentos Destino Esperado:
+${JSON.stringify(targets.map(e => ({ id: e.id, data: e.date, conta: e.accountCode, historico: e.history, valor: e.debit || e.credit })), null, 2)}
+
+Retorne um JSON com a seguinte estrutura:
 {
-  "findings": [
-    {
-      "severity": "critical" | "moderate" | "observation",
-      "category": "string",
-      "accountsInvolved": ["string"],
-      "description": "string justificando o problema",
-      "historyExtract": "trecho relevante",
+  "matchedPairs": [
+    { "entryIdA": 123, "entryIdB": 456, "confidence": "alta"|"media"|"baixa", "reasoning": "string" }
+  ],
+  "stillUnmatched": [
+    { 
+      "entryId": 123, 
+      "reason": "motivo pelo qual não encontrou par",
       "suggestedAdjustment": {
-        "debitAccountCode": "string",
-        "creditAccountCode": "string",
-        "amount": 0,
-        "history": "string",
-        "reason": "string"
+        "debitAccountCode": "código da conta débito",
+        "creditAccountCode": "código da conta crédito",
+        "amount": 100.00,
+        "history": "histórico sugerido",
+        "reason": "motivo do ajuste"
       }
     }
   ]
 }
-  `;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        temperature: 0.2
+Nota: "stillUnmatched" deve conter os IDs da Origem que NÃO conseguiram par.
+      `;
+      
+      try {
+          const response = await ai.models.generateContent({
+             model: 'gemini-2.5-flash',
+             contents: prompt,
+             config: { responseMimeType: 'application/json', temperature: 0.1 }
+          });
+          
+          if (response.text) {
+             const data = JSON.parse(response.text);
+             
+             if (data.matchedPairs) {
+                 for (const pair of data.matchedPairs) {
+                     if (pair.confidence === 'baixa') {
+                         const src = sources.find(s => s.id === pair.entryIdA);
+                         const tgt = targets.find(t => t.id === pair.entryIdB);
+                         if (src && tgt) {
+                             aiFindings.push({
+                                 companyId,
+                                 period,
+                                 severity: 'observation',
+                                 category: 'Pareamento por IA de Baixa Confiança',
+                                 accountsInvolved: [src.accountCode, tgt.accountCode],
+                                 description: `A IA pareou estes lançamentos com baixa confiança: ${pair.reasoning}`,
+                                 historyExtract: `Origem: ${src.history}\nDestino: ${tgt.history}`,
+                                 relatedEntryIds: [src.id as number, tgt.id as number],
+                                 resolved: false
+                             });
+                         }
+                     }
+                 }
+             }
+             
+             if (data.stillUnmatched) {
+                 for (const un of data.stillUnmatched) {
+                     const src = sources.find(s => s.id === un.entryId);
+                     if (src) {
+                         aiFindings.push({
+                             companyId,
+                             period,
+                             severity: 'moderate',
+                             category: 'Lançamento Faltante',
+                             accountsInvolved: [src.accountCode],
+                             description: `Lançamento sem contrapartida. Pareamento IA falhou: ${un.reason}`,
+                             historyExtract: src.history,
+                             suggestedAdjustment: un.suggestedAdjustment,
+                             relatedEntryIds: [src.id as number],
+                             resolved: false
+                         });
+                     }
+                 }
+             }
+          }
+      } catch (e) {
+          console.error("Erro na IA para a cadeia", chainName, e);
+          for (const src of sources) aiFindings.push(generateMissingFinding(src, expectedTargetName));
       }
-    });
+  };
 
-    if (response.text) {
-      const data = JSON.parse(response.text);
-      if (data.findings && Array.isArray(data.findings)) {
-         return data.findings.map((f: any) => ({
-           companyId,
-           period,
-           severity: f.severity,
-           category: f.category,
-           accountsInvolved: f.accountsInvolved || [],
-           description: f.description,
-           historyExtract: f.historyExtract,
-           suggestedAdjustment: f.suggestedAdjustment,
-           resolved: false
-         }));
-      }
-    }
-  } catch (e) {
-    console.error("AI Audit error", e);
-  }
+  await processChain('Receita → Clientes', unmatchedPool.receitaCliente.sources, unmatchedPool.receitaCliente.targets, 'Clientes a Receber');
+  await processChain('Clientes → Caixa/Banco', unmatchedPool.clienteCaixaBanco.sources, unmatchedPool.clienteCaixaBanco.targets, 'Caixa ou Banco');
+  await processChain('Caixa → Banco', unmatchedPool.caixaBanco.sources, unmatchedPool.caixaBanco.targets, 'Banco');
   
-  return [];
+  return aiFindings;
 }
+
