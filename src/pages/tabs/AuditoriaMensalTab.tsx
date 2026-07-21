@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { db, type AuditFinding, type LedgerEntry, type Account } from '../../lib/db';
 import { parseFileToData } from '../../lib/fileParser';
-import { parseLedgerData, runDeterministicAudit, runAIAudit } from '../../lib/auditEngine';
+import { parseLedgerData, runDeterministicAudit, runAIAudit, runFullAIAudit } from '../../lib/auditEngine';
 import { Button } from '../../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../../components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
@@ -84,7 +84,7 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
       // Clear old findings
       await db.auditFindings
         .where('companyId').equals(companyId)
-        .and(f => f.period === period)
+        .and(f => f.period === period && !f.category.startsWith('Varredura Completa'))
         .delete();
         
       const { findings: deterministicFindings, unmatchedPool } = await runDeterministicAudit(companyId, period);
@@ -103,6 +103,32 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
     } catch (error) {
       console.error(error);
       alert('Erro ao executar auditoria.');
+    } finally {
+      setLoading(false);
+      setProgressText('');
+    }
+  };
+
+  const handleFullAiScan = async () => {
+    if (!period) return;
+    setLoading(true);
+    try {
+      setProgressText('Iniciando varredura completa...');
+      // Clear old full scan findings
+      await db.auditFindings
+        .where('companyId').equals(companyId)
+        .and(f => f.period === period && f.category.startsWith('Varredura Completa'))
+        .delete();
+        
+      const fullScanFindings = await runFullAIAudit(companyId, period, setProgressText);
+      if (fullScanFindings.length > 0) {
+        await db.auditFindings.bulkAdd(fullScanFindings);
+      }
+      await loadFindings();
+      alert('Varredura completa concluída!');
+    } catch (error) {
+      console.error(error);
+      alert('Erro ao executar varredura completa.');
     } finally {
       setLoading(false);
       setProgressText('');
@@ -335,18 +361,37 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
               </Button>
             </div>
 
-            <Button 
-              onClick={handleRunAudit} 
-              disabled={loading || !period} 
-              className="gap-2 bg-virgula-green hover:bg-emerald-600 text-white ml-auto"
-            >
-              {loading ? (
-                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-              ) : (
-                <Play className="w-4 h-4" />
-              )}
-              Rodar Auditoria
-            </Button>
+            <div className="ml-auto flex items-center gap-3">
+              <div className="flex flex-col items-center">
+                <Button 
+                  onClick={handleFullAiScan} 
+                  disabled={loading || !period} 
+                  variant="outline"
+                  className="gap-2 border-purple-200 text-purple-700 hover:bg-purple-50 hover:text-purple-800"
+                >
+                  {loading ? (
+                    <div className="w-4 h-4 border-2 border-purple-600 border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <Sparkles className="w-4 h-4" />
+                  )}
+                  Varredura Completa por IA
+                </Button>
+                <span className="text-[10px] text-gray-400 mt-1">Lento (varre 100% dos lançamentos)</span>
+              </div>
+
+              <Button 
+                onClick={handleRunAudit} 
+                disabled={loading || !period} 
+                className="gap-2 bg-virgula-green hover:bg-emerald-600 text-white"
+              >
+                {loading ? (
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <Play className="w-4 h-4" />
+                )}
+                Rodar Auditoria
+              </Button>
+            </div>
           </div>
           
           {progressText && (

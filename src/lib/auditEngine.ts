@@ -127,7 +127,6 @@ export async function runDeterministicAudit(companyId: number, period: string): 
   
   // Load data
   const accounts = await db.accounts.where('companyId').equals(companyId).toArray();
-  const physicalAccounts = accounts.filter(a => a.isPhysicalAccount);
   
   const entries = await db.ledgerEntries
     .where('companyId').equals(companyId)
@@ -135,40 +134,69 @@ export async function runDeterministicAudit(companyId: number, period: string): 
     .toArray();
     
   const razaoEntries = entries.filter(e => e.source === 'razao');
+
+  // Dynamic Account Grouping based on Classification (SPED / standard prefix logic)
+  const accountGroups = new Map<string, string>();
+  accounts.forEach(a => {
+    const cls = a.classification;
+    let group = 'Outro';
+    if (cls.startsWith('1.1.1')) group = 'Ativo Financeiro';
+    else if (cls.startsWith('1.1.')) group = 'Ativo Operacional';
+    else if (cls.startsWith('2.1.')) group = 'Passivo Circulante';
+    else if (cls.startsWith('3.1.') || (cls.startsWith('3.') && !cls.match(/^3\.[2-9]/))) group = 'Receita';
+    else if (cls.startsWith('3.2.') || cls.startsWith('4.1.')) group = 'Custo';
+    else if (cls.startsWith('3.') || cls.startsWith('4.')) group = 'Despesa';
+    accountGroups.set(a.code, group);
+  });
+
+  const getExpectedCounterpartGroups = (group: string | undefined): string[] => {
+    switch (group) {
+        case 'Receita': return ['Ativo Operacional', 'Ativo Financeiro'];
+        case 'Custo': 
+        case 'Despesa': return ['Passivo Circulante', 'Ativo Operacional', 'Ativo Financeiro'];
+        case 'Ativo Operacional': return ['Ativo Financeiro', 'Receita', 'Passivo Circulante'];
+        case 'Passivo Circulante': return ['Ativo Financeiro', 'Custo', 'Despesa', 'Ativo Operacional'];
+        case 'Ativo Financeiro': return ['Ativo Financeiro', 'Ativo Operacional', 'Passivo Circulante'];
+        default: return [];
+    }
+  };
   
-  // 1 & 2. Reconstruct daily balance & Check negative intra-month
-  for (const acc of physicalAccounts) {
+  // 1 & 2. Reconstruct daily balance & Check negative intra-month (For Physical Accounts)
+  // 3. Block entry detection (For ALL Accounts)
+  for (const acc of accounts) {
     const accEntries = razaoEntries
       .filter(e => e.accountCode === acc.code)
       .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
       
     if (accEntries.length === 0) continue;
     
-    let runningBalance = accEntries[0].previousBalance || 0;
-    let lowestBalance = runningBalance;
-    let lowestDate = '';
-    
-    for (const entry of accEntries) {
-      runningBalance += (entry.debit - entry.credit);
-      if (runningBalance < lowestBalance) {
-        lowestBalance = runningBalance;
-        lowestDate = entry.date || '';
+    if (acc.isPhysicalAccount) {
+      let runningBalance = accEntries[0].previousBalance || 0;
+      let lowestBalance = runningBalance;
+      let lowestDate = '';
+      
+      for (const entry of accEntries) {
+        runningBalance += (entry.debit - entry.credit);
+        if (runningBalance < lowestBalance) {
+          lowestBalance = runningBalance;
+          lowestDate = entry.date || '';
+        }
+      }
+      
+      if (lowestBalance < 0) {
+        findings.push({
+          companyId,
+          period,
+          severity: 'critical',
+          category: 'Saldo Negativo em Conta Física',
+          accountsInvolved: [acc.code],
+          description: `A conta ${acc.code} (${acc.description}) ficou com saldo negativo de R$ ${lowestBalance.toFixed(2)} na data ${lowestDate}. Contas físicas não podem negativar.`,
+          resolved: false
+        });
       }
     }
     
-    if (lowestBalance < 0) {
-      findings.push({
-        companyId,
-        period,
-        severity: 'critical',
-        category: 'Saldo Negativo em Conta Física',
-        accountsInvolved: [acc.code],
-        description: `A conta ${acc.code} (${acc.description}) ficou com saldo negativo de R$ ${lowestBalance.toFixed(2)} na data ${lowestDate}. Contas físicas não podem negativar.`,
-        resolved: false
-      });
-    }
-    
-    // 3. Block entry detection (Cross-reference single large entry with sum of related opposite entries)
+    // Block entry detection (Cross-reference single entry with sum of related expected opposite entries)
     if (accEntries.length > 1) {
        const debits = accEntries.filter(e => e.debit > 0);
        const credits = accEntries.filter(e => e.credit > 0);
@@ -177,27 +205,25 @@ export async function runDeterministicAudit(companyId: number, period: string): 
            if (singles.length === 1 && multiples.length > 1) {
                const single = singles[0];
                const singleAmount = isDebitSingle ? single.debit : single.credit;
-               const sumOpposite = multiples.reduce((sum, e) => sum + (isDebitSingle ? e.credit : e.debit), 0);
                
-               if (sumOpposite > 0 && Math.abs(singleAmount - sumOpposite) / sumOpposite <= 0.02) {
-                   // Related accounts check
-                   const relatedEntries = razaoEntries.filter(e => e.accountCode.startsWith('1.1') && e.accountCode !== acc.code);
-                   const sumRelated = relatedEntries.reduce((sum, e) => sum + (isDebitSingle ? e.credit : e.debit), 0);
-                   
-                   // Se bate internamente ou com conta relacionada
-                   if (Math.abs(singleAmount - sumRelated) / sumRelated <= 0.02 || true) { // Always flag internal imbalance blocks
-                       findings.push({
-                         companyId,
-                         period,
-                         severity: 'moderate',
-                         category: 'Lançamento em Bloco Retroativo',
-                         accountsInvolved: [acc.code],
-                         description: `Identificado um único lançamento consolidado grande no mês para a conta ${acc.code} (${acc.description}) que bate com a soma de dezenas de contrapartidas. Valor: R$ ${singleAmount.toFixed(2)}.`,
-                         historyExtract: single.history,
-                         relatedEntryIds: [single.id as number, ...multiples.map(e => e.id as number)],
-                         resolved: false
-                       });
-                   }
+               const myGroup = accountGroups.get(acc.code);
+               const relatedGroups = getExpectedCounterpartGroups(myGroup);
+               
+               const relatedEntries = razaoEntries.filter(e => relatedGroups.includes(accountGroups.get(e.accountCode) || ''));
+               const sumRelated = relatedEntries.reduce((sum, e) => sum + (isDebitSingle ? e.credit : e.debit), 0);
+               
+               if (sumRelated > 0 && Math.abs(singleAmount - sumRelated) / sumRelated <= 0.02) {
+                   findings.push({
+                     companyId,
+                     period,
+                     severity: 'moderate',
+                     category: 'Lançamento em Bloco Retroativo',
+                     accountsInvolved: [acc.code],
+                     description: `Identificado um único lançamento consolidado grande no mês para a conta ${acc.code} (${acc.description}) que bate com a soma de dezenas de contrapartidas em contas relacionadas (${relatedGroups.join(', ')}). Valor: R$ ${singleAmount.toFixed(2)}.`,
+                     historyExtract: single.history,
+                     relatedEntryIds: [single.id as number, ...multiples.map(e => e.id as number)],
+                     resolved: false
+                   });
                }
            }
        };
@@ -206,35 +232,26 @@ export async function runDeterministicAudit(companyId: number, period: string): 
     }
   }
 
-  // Chain categorization
-  const receitaCodes = new Set(accounts.filter(a => a.classification.startsWith('3.')).map(a => a.code));
-  const clienteCodes = new Set(accounts.filter(a => a.description.toLowerCase().includes('cliente') && a.classification.startsWith('1.')).map(a => a.code));
-  const caixaCodes = new Set(accounts.filter(a => a.description.toLowerCase().includes('caixa') && a.classification.startsWith('1.1.')).map(a => a.code));
-  const bancoCodes = new Set(accounts.filter(a => a.description.toLowerCase().includes('banco') && a.classification.startsWith('1.1.')).map(a => a.code));
+  // 4. Chain categorization and matching
+  const globalMatchedIds = new Set<number>();
   
-  const entriesReceita = razaoEntries.filter(e => receitaCodes.has(e.accountCode));
-  const entriesCliente = razaoEntries.filter(e => clienteCodes.has(e.accountCode));
-  const entriesCaixa = razaoEntries.filter(e => caixaCodes.has(e.accountCode));
-  const entriesBanco = razaoEntries.filter(e => bancoCodes.has(e.accountCode));
-
   const matchEntries = (
     sources: LedgerEntry[], 
     targets: LedgerEntry[], 
-    allEntries: LedgerEntry[], 
+    allTargets: LedgerEntry[], 
     expectedTargetCodes: Set<string>,
     sourceName: string,
     targetName: string
   ) => {
     const matchedSourceIds = new Set<number>();
-    const matchedTargetIds = new Set<number>();
     
     for (const source of sources) {
-      if (!source.id) continue;
+      if (!source.id || globalMatchedIds.has(source.id)) continue;
       const keys = extractKeys(source.history || '');
       
       // 1. Try to find in expected targets
       const targetMatch = targets.find(t => {
-        if (!t.id || matchedTargetIds.has(t.id)) return false;
+        if (!t.id || globalMatchedIds.has(t.id)) return false;
         if (Math.abs((source.credit || source.debit) - (t.debit || t.credit)) > 0.01) return false;
         
         const tKeys = extractKeys(t.history || '');
@@ -250,13 +267,14 @@ export async function runDeterministicAudit(companyId: number, period: string): 
       
       if (targetMatch) {
         matchedSourceIds.add(source.id);
-        matchedTargetIds.add(targetMatch.id as number);
+        globalMatchedIds.add(source.id);
+        globalMatchedIds.add(targetMatch.id as number);
         continue;
       }
       
       // 2. Try to find in WRONG targets
-      const wrongMatch = allEntries.find(t => {
-        if (!t.id || matchedTargetIds.has(t.id) || t.accountCode === source.accountCode) return false;
+      const wrongMatch = allTargets.find(t => {
+        if (!t.id || globalMatchedIds.has(t.id) || t.accountCode === source.accountCode) return false;
         if (expectedTargetCodes.has(t.accountCode)) return false;
         
         if (Math.abs((source.credit || source.debit) - (t.debit || t.credit)) > 0.01) return false;
@@ -271,14 +289,15 @@ export async function runDeterministicAudit(companyId: number, period: string): 
       
       if (wrongMatch) {
         matchedSourceIds.add(source.id);
-        matchedTargetIds.add(wrongMatch.id as number);
+        globalMatchedIds.add(source.id);
+        globalMatchedIds.add(wrongMatch.id as number);
         findings.push({
            companyId: source.companyId,
            period: source.period,
            severity: 'moderate',
            category: 'Lançamento em Conta Errada',
            accountsInvolved: [source.accountCode, wrongMatch.accountCode],
-           description: `Lançamento originado em ${sourceName} possui contrapartida registrada na conta incorreta ${wrongMatch.accountCode} (${wrongMatch.accountDescription}). Esperado: grupo ${targetName}.`,
+           description: `Lançamento originado em ${sourceName} (${source.accountCode}) possui contrapartida registrada na conta incorreta ${wrongMatch.accountCode} (${wrongMatch.accountDescription}). Esperado: grupo ${targetName}.`,
            historyExtract: `Origem: ${source.history}\nDestino Encontrado: ${wrongMatch.history}`,
            relatedEntryIds: [source.id, wrongMatch.id as number],
            resolved: false
@@ -287,32 +306,51 @@ export async function runDeterministicAudit(companyId: number, period: string): 
     }
     
     return { 
-      matchedTargetIds,
-      unmatchedSources: sources.filter(s => s.id && !matchedSourceIds.has(s.id)),
-      unmatchedTargets: targets.filter(t => t.id && !matchedTargetIds.has(t.id))
+      unmatchedSources: sources.filter(s => s.id && !matchedSourceIds.has(s.id) && !globalMatchedIds.has(s.id)),
     };
   };
 
-  const expectedClienteCodes = clienteCodes;
-  const expectedCaixaBancoCodes = new Set([...caixaCodes, ...bancoCodes]);
-  const expectedBancoCodes = bancoCodes;
+  const chains = [
+    { name: 'Receita', sourceGroup: 'Receita', targetGroups: ['Ativo Operacional', 'Ativo Financeiro'], sourceNature: 'credit' },
+    { name: 'Custo', sourceGroup: 'Custo', targetGroups: ['Passivo Circulante', 'Ativo Operacional', 'Ativo Financeiro'], sourceNature: 'debit' },
+    { name: 'Despesa', sourceGroup: 'Despesa', targetGroups: ['Passivo Circulante', 'Ativo Financeiro'], sourceNature: 'debit' },
+    { name: 'Ativo Operacional (Baixa)', sourceGroup: 'Ativo Operacional', targetGroups: ['Ativo Financeiro'], sourceNature: 'credit' },
+    { name: 'Passivo Circulante (Pagamento)', sourceGroup: 'Passivo Circulante', targetGroups: ['Ativo Financeiro'], sourceNature: 'debit' }
+  ];
 
-  const res1 = matchEntries(entriesReceita.filter(e => e.credit > 0), entriesCliente.filter(e => e.debit > 0), razaoEntries.filter(e => e.debit > 0), expectedClienteCodes, 'Receita', 'Clientes a Receber');
-  const res2 = matchEntries(entriesCliente.filter(e => e.credit > 0), [...entriesCaixa.filter(e => e.debit > 0), ...entriesBanco.filter(e => e.debit > 0)], razaoEntries.filter(e => e.debit > 0), expectedCaixaBancoCodes, 'Clientes a Receber', 'Caixa ou Banco');
-  const res3 = matchEntries(entriesCaixa.filter(e => e.credit > 0), entriesBanco.filter(e => e.debit > 0), razaoEntries.filter(e => e.debit > 0), expectedBancoCodes, 'Caixa', 'Banco');
+  const unmatchedPool: any[] = [];
 
-  const unmatchedPool = {
-      receitaCliente: { sources: res1.unmatchedSources, targets: res1.unmatchedTargets },
-      clienteCaixaBanco: { sources: res2.unmatchedSources, targets: res2.unmatchedTargets },
-      caixaBanco: { sources: res3.unmatchedSources, targets: res3.unmatchedTargets }
-  };
+  for (const chain of chains) {
+     const sourceCodes = new Set(accounts.filter(a => accountGroups.get(a.code) === chain.sourceGroup).map(a => a.code));
+     const targetCodes = new Set(accounts.filter(a => chain.targetGroups.includes(accountGroups.get(a.code) || '')).map(a => a.code));
+     
+     const sources = razaoEntries.filter(e => sourceCodes.has(e.accountCode) && (chain.sourceNature === 'credit' ? e.credit > 0 : e.debit > 0));
+     const allTargets = razaoEntries.filter(e => chain.sourceNature === 'credit' ? e.debit > 0 : e.credit > 0);
+     const expectedTargets = allTargets.filter(e => targetCodes.has(e.accountCode));
+     
+     const res = matchEntries(
+         sources,
+         expectedTargets,
+         allTargets,
+         targetCodes,
+         chain.sourceGroup,
+         chain.targetGroups.join(' ou ')
+     );
+     
+     unmatchedPool.push({
+         chainName: chain.name,
+         sources: res.unmatchedSources,
+         targets: expectedTargets.filter(t => !globalMatchedIds.has(t.id as number)),
+         expectedTargetName: chain.targetGroups.join(' ou ')
+     });
+  }
 
   // 6. Pente fino Resultado x Realização Financeira
   const balanceteEntries = entries.filter(e => e.source === 'balancete');
-  const totalReceita = balanceteEntries.filter(e => e.accountCode.startsWith('3.')).reduce((acc, e) => acc + e.credit - e.debit, 0);
+  const totalReceita = balanceteEntries.filter(e => accountGroups.get(e.accountCode) === 'Receita').reduce((acc, e) => acc + e.credit - e.debit, 0);
   
   const totalCaixaBancoIn = razaoEntries
-    .filter(e => e.debit > 0 && (caixaCodes.has(e.accountCode) || bancoCodes.has(e.accountCode)))
+    .filter(e => e.debit > 0 && accountGroups.get(e.accountCode) === 'Ativo Financeiro')
     .reduce((acc, e) => acc + e.debit, 0);
     
   if (totalReceita > 0 && totalCaixaBancoIn < totalReceita * 0.1) {
@@ -322,7 +360,7 @@ export async function runDeterministicAudit(companyId: number, period: string): 
       severity: 'observation',
       category: 'Divergência Resultado x Realização',
       accountsInvolved: [],
-      description: `A receita reconhecida no período foi de R$ ${totalReceita.toFixed(2)}, mas as entradas identificadas em Caixa/Bancos somam apenas R$ ${totalCaixaBancoIn.toFixed(2)}. Verifique o regime de caixa.`,
+      description: `A receita reconhecida no período foi de R$ ${totalReceita.toFixed(2)}, mas as entradas identificadas no Ativo Financeiro (Caixa/Bancos) somam apenas R$ ${totalCaixaBancoIn.toFixed(2)}. Verifique o regime de caixa.`,
       resolved: false
     });
   }
@@ -365,7 +403,7 @@ export async function runDeterministicAudit(companyId: number, period: string): 
 export async function runAIAudit(
   companyId: number, 
   period: string, 
-  unmatchedPool: any, 
+  unmatchedPool: any[], 
   onProgress?: (msg: string) => void
 ): Promise<AuditFinding[]> {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -384,9 +422,9 @@ export async function runAIAudit(
   });
 
   if (!apiKey) {
-     for (const src of unmatchedPool.receitaCliente.sources) aiFindings.push(generateMissingFinding(src, 'Clientes a Receber'));
-     for (const src of unmatchedPool.clienteCaixaBanco.sources) aiFindings.push(generateMissingFinding(src, 'Caixa ou Banco'));
-     for (const src of unmatchedPool.caixaBanco.sources) aiFindings.push(generateMissingFinding(src, 'Banco'));
+     for (const pool of unmatchedPool) {
+       for (const src of pool.sources) aiFindings.push(generateMissingFinding(src, pool.expectedTargetName));
+     }
      return aiFindings;
   }
   
@@ -492,10 +530,100 @@ Nota: "stillUnmatched" deve conter os IDs da Origem que NÃO conseguiram par.
       }
   };
 
-  await processChain('Receita → Clientes', unmatchedPool.receitaCliente.sources, unmatchedPool.receitaCliente.targets, 'Clientes a Receber');
-  await processChain('Clientes → Caixa/Banco', unmatchedPool.clienteCaixaBanco.sources, unmatchedPool.clienteCaixaBanco.targets, 'Caixa ou Banco');
-  await processChain('Caixa → Banco', unmatchedPool.caixaBanco.sources, unmatchedPool.caixaBanco.targets, 'Banco');
+  for (const pool of unmatchedPool) {
+     await processChain(pool.chainName, pool.sources, pool.targets, pool.expectedTargetName);
+  }
   
   return aiFindings;
 }
+
+export async function runFullAIAudit(
+  companyId: number, 
+  period: string, 
+  onProgress?: (msg: string) => void
+): Promise<AuditFinding[]> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    alert("API Key do Gemini não configurada.");
+    return [];
+  }
+  
+  const aiFindings: AuditFinding[] = [];
+  const ai = new GoogleGenAI({ apiKey });
+  
+  const accounts = await db.accounts.where('companyId').equals(companyId).toArray();
+  const entries = await db.ledgerEntries
+    .where('companyId').equals(companyId)
+    .and(e => e.period === period && e.source === 'razao')
+    .toArray();
+    
+  const BATCH_SIZE = 200;
+  
+  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+      const batch = entries.slice(i, i + BATCH_SIZE);
+      onProgress?.(`Varredura Completa: Analisando lote ${Math.floor(i/BATCH_SIZE) + 1} de ${Math.ceil(entries.length/BATCH_SIZE)}...`);
+      
+      const prompt = `
+Você é um auditor contábil experiente.
+Temos o seguinte plano de contas (reduzido):
+${JSON.stringify(accounts.map(a => ({ code: a.code, name: a.description, class: a.classification })), null, 2)}
+
+E o seguinte lote de lançamentos do Razão:
+${JSON.stringify(batch.map(e => ({ id: e.id, data: e.date, conta: e.accountCode, historico: e.history, debito: e.debit, credito: e.credit })), null, 2)}
+
+Sua tarefa é fazer uma varredura completa e identificar inconsistências, tais como:
+1. Lançamento em conta incompatível com o histórico descrito.
+2. Ausência aparente de contrapartida lógica (considerando as informações do histórico).
+3. Valor incoerente ou atípico.
+4. Lançamento que deveria existir em outra conta e não existe.
+
+Retorne um JSON com os achados:
+{
+  "findings": [
+    {
+      "severity": "critical" | "moderate" | "observation",
+      "category": "Título da inconsistência",
+      "accountsInvolved": ["código da conta"],
+      "description": "Explicação detalhada do problema",
+      "historyExtract": "Trecho do histórico",
+      "entryId": 123
+    }
+  ]
+}
+      `;
+      
+      try {
+          const response = await ai.models.generateContent({
+             model: 'gemini-2.5-flash',
+             contents: prompt,
+             config: { responseMimeType: 'application/json', temperature: 0.1 }
+          });
+          
+          if (response.text) {
+             const data = JSON.parse(response.text);
+             if (data.findings) {
+                 for (const f of data.findings) {
+                     const entry = batch.find(e => e.id === f.entryId);
+                     aiFindings.push({
+                         companyId,
+                         period,
+                         severity: f.severity || 'observation',
+                         category: `Varredura Completa: ${f.category}`,
+                         accountsInvolved: f.accountsInvolved || (entry ? [entry.accountCode] : []),
+                         description: f.description,
+                         historyExtract: f.historyExtract || (entry ? entry.history : undefined),
+                         relatedEntryIds: entry ? [entry.id as number] : [],
+                         resolved: false
+                     });
+                 }
+             }
+          }
+      } catch (e) {
+          console.error("Erro na IA Full Scan lote", i, e);
+      }
+  }
+  
+  return aiFindings;
+}
+
 
