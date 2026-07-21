@@ -16,7 +16,7 @@ export async function parseLedgerData(
   for (let i = 0; i < Math.min(20, rawData.length); i++) {
     const row = rawData[i];
     const rowStr = JSON.stringify(row).toLowerCase();
-    if (rowStr.includes('conta') || rowStr.includes('código') || rowStr.includes('descrição') || rowStr.includes('saldo')) {
+    if (rowStr.includes('conta') || rowStr.includes('código') || rowStr.includes('descrição') || rowStr.includes('saldo') || (rowStr.includes('debitar') && rowStr.includes('creditar'))) {
       headerRow = i;
       break;
     }
@@ -43,6 +43,51 @@ export async function parseLedgerData(
        // Try matching keys
        const keys = Object.keys(row);
        
+       let isDoubleEntryRow = false;
+       for (const key of keys) {
+           const k = key.toLowerCase();
+           if (k === 'debitar' || k === 'creditar') {
+               isDoubleEntryRow = true;
+               break;
+           }
+       }
+
+       if (isDoubleEntryRow) {
+           let debitarCode = '';
+           let creditarCode = '';
+           let valAmount = 0;
+           
+           for (const key of keys) {
+               const k = key.toLowerCase();
+               const val = row[key];
+               if (k === 'debitar') debitarCode = String(val);
+               else if (k === 'creditar') creditarCode = String(val);
+               else if (k === 'valor') valAmount = parseAmount(val);
+               else if (k === 'histórico' || k === 'historico') history = String(val);
+               else if (k === 'data') date = String(val);
+           }
+
+           if (debitarCode && debitarCode.trim()) {
+               entries.push({
+                   companyId, period, source,
+                   accountCode: debitarCode.trim(), accountDescription: '',
+                   previousBalance: 0, debit: valAmount, credit: 0, currentBalance: 0,
+                   date: date.trim(), history: history.trim(),
+                   contrapartidaAccountCode: creditarCode.trim()
+               });
+           }
+           if (creditarCode && creditarCode.trim()) {
+               entries.push({
+                   companyId, period, source,
+                   accountCode: creditarCode.trim(), accountDescription: '',
+                   previousBalance: 0, debit: 0, credit: valAmount, currentBalance: 0,
+                   date: date.trim(), history: history.trim(),
+                   contrapartidaAccountCode: debitarCode.trim()
+               });
+           }
+           continue; // Skip the rest for this row
+       }
+
        // Detect Context Row (Razão exported format where account is on its own line)
        let isContextRow = false;
        for (const key of keys) {
@@ -672,6 +717,7 @@ Sua tarefa é fazer uma varredura completa e identificar inconsistências, tais 
 2. Ausência aparente de contrapartida lógica (considerando as informações do histórico).
 3. Valor incoerente ou atípico.
 4. Lançamento que deveria existir em outra conta e não existe.
+5. Inconsistências ou falta de lançamentos relacionados ao CMV (Custo da Mercadoria Vendida) ou contas de Resultado.
 
 Retorne um JSON com os achados:
 {
