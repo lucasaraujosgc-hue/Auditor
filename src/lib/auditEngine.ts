@@ -24,6 +24,9 @@ export async function parseLedgerData(
 
   const isObject = !Array.isArray(rawData[0]) && typeof rawData[0] === 'object';
   
+  let currentContextAccountCode = '';
+  let currentContextAccountDesc = '';
+
   for (let i = headerRow + 1; i < rawData.length; i++) {
     const row = rawData[i];
     let accountCode = '';
@@ -38,6 +41,36 @@ export async function parseLedgerData(
     if (isObject) {
        // Try matching keys
        const keys = Object.keys(row);
+       
+       // Detect Context Row (Razão exported format where account is on its own line)
+       let isContextRow = false;
+       for (const key of keys) {
+           const val = String(row[key] || '');
+           if (val.trim().toLowerCase() === 'conta:') {
+               isContextRow = true;
+               break;
+           }
+       }
+       
+       if (isContextRow) {
+           // Extract code and desc from this row
+           const vals = Object.values(row).map(v => String(v || '').trim()).filter(v => v !== '' && v.toLowerCase() !== 'conta:');
+           if (vals.length >= 2) {
+               currentContextAccountCode = vals[0].length < vals[1].length && vals[0].match(/[\d.]/) ? vals[1] : vals[0]; // Heuristic for code
+               currentContextAccountDesc = vals.length > 1 ? vals[vals.length - 1] : '';
+               
+               // Better heuristic if we know typical structure
+               // "5", "1.1.1.01.001", "CAIXA GERAL"
+               const possibleCode = vals.find(v => v.match(/^[\d.]+$/) && v.includes('.'));
+               if (possibleCode) {
+                   currentContextAccountCode = possibleCode;
+                   const codeIdx = vals.indexOf(possibleCode);
+                   currentContextAccountDesc = vals.slice(codeIdx + 1).join(' ');
+               }
+           }
+           continue; // Skip processing this as a transaction
+       }
+
        for (const key of keys) {
          const k = key.toLowerCase();
          const val = row[key];
@@ -50,6 +83,13 @@ export async function parseLedgerData(
          else if (k.includes('data')) date = String(val);
          else if (k.includes('histórico') || k.includes('historico')) history = String(val);
        }
+       
+       // Apply context if no explicit account code found
+       if (!accountCode && currentContextAccountCode && source === 'razao' && date && history) {
+           accountCode = currentContextAccountCode;
+           accountDescription = currentContextAccountDesc;
+       }
+       
     } else if (Array.isArray(row)) {
        // Fallback positional
        // Typical Balancete: Code | Desc | Prev | Debit | Credit | Current
