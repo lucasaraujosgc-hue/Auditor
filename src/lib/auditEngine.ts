@@ -37,6 +37,7 @@ export async function parseLedgerData(
     let currentBalance = 0;
     let date = '';
     let history = '';
+    let contrapartida = '';
 
     if (isObject) {
        // Try matching keys
@@ -82,6 +83,7 @@ export async function parseLedgerData(
          else if (k.includes('atual') || k.includes('final')) currentBalance = parseAmount(val);
          else if (k.includes('data')) date = String(val);
          else if (k.includes('histórico') || k.includes('historico')) history = String(val);
+         else if (k.includes('cta.c.part') || k.includes('contra')) contrapartida = String(val);
        }
        
        // Apply context if no explicit account code found
@@ -92,23 +94,44 @@ export async function parseLedgerData(
        
     } else if (Array.isArray(row)) {
        // Fallback positional
-       // Typical Balancete: Code | Desc | Prev | Debit | Credit | Current
-       // Typical Razão: Date | Code | Desc | History | Debit | Credit | Balance
        if (source === 'balancete') {
-         accountCode = String(row[0] || '');
-         accountDescription = String(row[1] || '');
-         previousBalance = parseAmount(row[2]);
-         debit = parseAmount(row[3]);
-         credit = parseAmount(row[4]);
-         currentBalance = parseAmount(row[5]);
+         if (row.length >= 7 && String(row[3]).match(/[\d.,]+[DC]?/i)) {
+             // Formato: Código | Classificação | Descrição | Saldo Ant | Débito | Crédito | Saldo Atual
+             accountCode = String(row[0] || '').trim();
+             accountDescription = String(row[2] || '').trim();
+             previousBalance = parseAmount(row[3]);
+             debit = parseAmount(row[4]);
+             credit = parseAmount(row[5]);
+             currentBalance = parseAmount(row[6]);
+         } else {
+             accountCode = String(row[0] || '');
+             accountDescription = String(row[1] || '');
+             previousBalance = parseAmount(row[2]);
+             debit = parseAmount(row[3]);
+             credit = parseAmount(row[4]);
+             currentBalance = parseAmount(row[5]);
+         }
        } else {
-         date = String(row[0] || '');
-         accountCode = String(row[1] || '');
-         accountDescription = String(row[2] || '');
-         history = String(row[3] || '');
-         debit = parseAmount(row[4]);
-         credit = parseAmount(row[5]);
-         currentBalance = parseAmount(row[6]);
+         // Razão
+         // PDF structure: Data | Histórico | Cta.C.Part | Débito | Crédito | Saldo
+         if (row.length >= 6) {
+             date = String(row[0] || '');
+             history = String(row[1] || '');
+             contrapartida = String(row[2] || '');
+             debit = parseAmount(row[3]);
+             credit = parseAmount(row[4]);
+             currentBalance = parseAmount(row[5]);
+             accountCode = currentContextAccountCode;
+             accountDescription = currentContextAccountDesc;
+         } else {
+             date = String(row[0] || '');
+             accountCode = String(row[1] || '');
+             accountDescription = String(row[2] || '');
+             history = String(row[3] || '');
+             debit = parseAmount(row[4]);
+             credit = parseAmount(row[5]);
+             currentBalance = parseAmount(row[6]);
+         }
        }
     }
     
@@ -125,7 +148,8 @@ export async function parseLedgerData(
         credit,
         currentBalance,
         date: date.trim(),
-        history: history.trim()
+        history: history.trim(),
+        contrapartidaAccountCode: contrapartida.trim()
       });
     }
   }
@@ -287,6 +311,38 @@ export async function runDeterministicAudit(companyId: number, period: string): 
     
     for (const source of sources) {
       if (!source.id || globalMatchedIds.has(source.id)) continue;
+      
+      // 0. Try direct match via contrapartidaAccountCode
+      if (source.contrapartidaAccountCode) {
+        const directMatch = allTargets.find(t =>
+          !globalMatchedIds.has(t.id as number) &&
+          t.accountCode === source.contrapartidaAccountCode &&
+          Math.abs((source.credit || source.debit) - (t.debit || t.credit)) <= 0.01 &&
+          (!source.date || !t.date || source.date === t.date)
+        );
+        if (directMatch) {
+            matchedSourceIds.add(source.id);
+            globalMatchedIds.add(source.id);
+            globalMatchedIds.add(directMatch.id as number);
+            
+            // Validate if contrapartida is the expected one
+            if (!expectedTargetCodes.has(directMatch.accountCode)) {
+                findings.push({
+                   companyId: source.companyId,
+                   period: source.period,
+                   severity: 'moderate',
+                   category: 'Lançamento em Conta Errada',
+                   accountsInvolved: [source.accountCode, directMatch.accountCode],
+                   description: `Lançamento originado em ${sourceName} (${source.accountCode}) aponta para contrapartida ${directMatch.accountCode} (${directMatch.accountDescription}). Esperado: grupo ${targetName}.`,
+                   historyExtract: `Origem: ${source.history}\nDestino Encontrado: ${directMatch.history}`,
+                   relatedEntryIds: [source.id, directMatch.id as number],
+                   resolved: false
+                });
+            }
+            continue;
+        }
+      }
+
       const keys = extractKeys(source.history || '');
       
       // 1. Try to find in expected targets

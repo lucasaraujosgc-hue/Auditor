@@ -53,6 +53,7 @@ export interface LedgerEntry {
   currentBalance: number;
   date?: string; // YYYY-MM-DD (para lançamentos do Razão)
   history?: string; // Histórico do lançamento
+  contrapartidaAccountCode?: string; // Cta.C.Part.
   source: 'balancete' | 'razao';
 }
 

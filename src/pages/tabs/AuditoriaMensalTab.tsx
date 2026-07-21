@@ -5,7 +5,7 @@ import { parseLedgerData, runDeterministicAudit, runAIAudit, runFullAIAudit } fr
 import { Button } from '../../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../../components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
-import { Upload, Play, ShieldAlert, Sparkles, CheckCircle2, ChevronDown, ChevronUp, FileText, Download } from 'lucide-react';
+import { Upload, Play, ShieldAlert, Sparkles, CheckCircle2, ChevronDown, ChevronUp, FileText, Download, Trash2 } from 'lucide-react';
 
 export default function AuditoriaMensalTab({ companyId }: { companyId: number }) {
   const [period, setPeriod] = useState<string>('');
@@ -132,6 +132,38 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
     } finally {
       setLoading(false);
       setProgressText('');
+    }
+  };
+
+  const handleDeleteFiles = async () => {
+    if (!period) {
+      alert('Selecione um período primeiro.');
+      return;
+    }
+    
+    if (!confirm(`Tem certeza que deseja apagar todos os dados importados (Balancete e Razão) do período ${period}? Isso também apagará os resultados da auditoria desse período.`)) {
+      return;
+    }
+
+    setLoading(true);
+    try {
+      await db.ledgerEntries
+        .where('companyId').equals(companyId)
+        .and(e => e.period === period)
+        .delete();
+        
+      await db.auditFindings
+        .where('companyId').equals(companyId)
+        .and(f => f.period === period)
+        .delete();
+        
+      setFindings([]);
+      alert(`Dados do período ${period} foram apagados com sucesso.`);
+    } catch (error) {
+      console.error(error);
+      alert('Erro ao apagar dados do período.');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -360,6 +392,16 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
                 Importar Razão
               </Button>
             </div>
+
+            <Button 
+              variant="outline" 
+              onClick={handleDeleteFiles} 
+              disabled={loading || !period}
+              className="gap-2 text-red-600 border-red-200 hover:bg-red-50 hover:text-red-700"
+            >
+              <Trash2 className="w-4 h-4" />
+              Limpar Período
+            </Button>
 
             <div className="ml-auto flex items-center gap-3">
               <div className="flex flex-col items-center">
