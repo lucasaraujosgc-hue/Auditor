@@ -64,7 +64,7 @@ export async function parseLedgerData(
                else if (k === 'creditar') creditarCode = String(val);
                else if (k === 'valor') valAmount = parseAmount(val);
                else if (k === 'histórico' || k === 'historico') history = String(val);
-               else if (k === 'data') date = String(val);
+               else if (k === 'data') date = parseDate(val);
            }
 
            if (debitarCode && debitarCode.trim()) {
@@ -126,7 +126,7 @@ export async function parseLedgerData(
          else if (k.includes('débito') || k.includes('debito') || (k === 'd' || k === 'deb')) debit = parseAmount(val);
          else if (k.includes('crédito') || k.includes('credito') || (k === 'c' || k === 'cred')) credit = parseAmount(val);
          else if (k.includes('atual') || k.includes('final')) currentBalance = parseAmount(val);
-         else if (k.includes('data')) date = String(val);
+         else if (k.includes('data')) date = parseDate(val);
          else if (k.includes('histórico') || k.includes('historico')) history = String(val);
          else if (k.includes('cta.c.part') || k.includes('contra')) contrapartida = String(val);
        }
@@ -160,7 +160,7 @@ export async function parseLedgerData(
          // Razão
          // PDF structure: Data | Histórico | Cta.C.Part | Débito | Crédito | Saldo
          if (row.length >= 6) {
-             date = String(row[0] || '');
+             date = parseDate(row[0] || '');
              history = String(row[1] || '');
              contrapartida = String(row[2] || '');
              debit = parseAmount(row[3]);
@@ -169,7 +169,7 @@ export async function parseLedgerData(
              accountCode = currentContextAccountCode;
              accountDescription = currentContextAccountDesc;
          } else {
-             date = String(row[0] || '');
+             date = parseDate(row[0] || '');
              accountCode = String(row[1] || '');
              accountDescription = String(row[2] || '');
              history = String(row[3] || '');
@@ -208,6 +208,24 @@ function parseAmount(val: any): number {
   const str = String(val).replace(/[^0-9,-]/g, '').replace(',', '.');
   const num = parseFloat(str);
   return isNaN(num) ? 0 : num;
+}
+
+export function parseDate(val: any): string {
+  if (!val) return '';
+  const str = String(val).trim();
+  
+  // Excel serial date (e.g., 45688)
+  if (/^\d{5}$/.test(str)) {
+    const excelEpoch = new Date(1899, 11, 30); // December 30, 1899
+    const parsedDate = new Date(excelEpoch.getTime() + parseInt(str, 10) * 86400000);
+    const dd = String(parsedDate.getDate()).padStart(2, '0');
+    const mm = String(parsedDate.getMonth() + 1).padStart(2, '0');
+    const yyyy = parsedDate.getFullYear();
+    return `${dd}/${mm}/${yyyy}`;
+  }
+  
+  // ISO Date (YYYY-MM-DD) or already formatted DD/MM/YYYY
+  return str;
 }
 
 // =============================================================================
@@ -325,15 +343,7 @@ export async function runDeterministicAudit(companyId: number, period: string): 
   // Dynamic Account Grouping based on Classification (SPED / standard prefix logic)
   const accountGroups = new Map<string, string>();
   accounts.forEach(a => {
-    const cls = a.classification;
-    let group = 'Outro';
-    if (cls.startsWith('1.1.1')) group = 'Ativo Financeiro';
-    else if (cls.startsWith('1.1.')) group = 'Ativo Operacional';
-    else if (cls.startsWith('2.1.')) group = 'Passivo Circulante';
-    else if (cls.startsWith('3.1.') || (cls.startsWith('3.') && !cls.match(/^3\.[2-9]/))) group = 'Receita';
-    else if (cls.startsWith('3.2.') || cls.startsWith('4.1.')) group = 'Custo';
-    else if (cls.startsWith('3.') || cls.startsWith('4.')) group = 'Despesa';
-    accountGroups.set(a.code, group);
+    accountGroups.set(a.code, getAccountGroup(a.classification, a.description));
   });
 
   const getExpectedCounterpartGroups = (group: string | undefined): string[] => {
@@ -357,7 +367,7 @@ export async function runDeterministicAudit(companyId: number, period: string): 
       
     if (accEntries.length === 0) continue;
     
-    if (acc.isPhysicalAccount) {
+    if (acc.isPhysicalAccount || accountGroups.get(acc.code) === 'Ativo Financeiro') {
       let runningBalance = accEntries[0].previousBalance || 0;
       let lowestBalance = runningBalance;
       let lowestDate = '';
@@ -375,9 +385,9 @@ export async function runDeterministicAudit(companyId: number, period: string): 
           companyId,
           period,
           severity: 'critical',
-          category: 'Saldo Negativo em Conta Física',
+          category: 'Saldo Negativo em Caixa/Bancos',
           accountsInvolved: [acc.code],
-          description: `A conta ${acc.code} (${acc.description}) ficou com saldo negativo de R$ ${lowestBalance.toFixed(2)} na data ${lowestDate}. Contas físicas não podem negativar.`,
+          description: `A conta ${acc.code} (${acc.description}) ficou com saldo negativo de R$ ${lowestBalance.toFixed(2)} na data ${lowestDate}. Contas de disponibilidades (caixa/bancos) não devem ficar credoras.`,
           resolved: false
         });
       }
@@ -436,7 +446,7 @@ export async function runDeterministicAudit(companyId: number, period: string): 
       if (!source.id || globalMatchedIds.has(source.id)) continue;
       
       // 0. Try direct match via contrapartidaAccountCode
-      if (source.contrapartidaAccountCode) {
+      if (source.contrapartidaAccountCode && source.contrapartidaAccountCode !== '0') {
         const directMatch = allTargets.find(t =>
           !globalMatchedIds.has(t.id as number) &&
           t.accountCode === source.contrapartidaAccountCode &&
@@ -566,6 +576,26 @@ export async function runDeterministicAudit(companyId: number, period: string): 
 
   // 6. Pente fino Resultado x Realização Financeira
   const balanceteEntries = entries.filter(e => e.source === 'balancete');
+  
+  // Inverted Balances Check (Analytical)
+  for (const entry of balanceteEntries) {
+     const group = accountGroups.get(entry.accountCode) || 'Outro';
+     if (group === 'Outro') continue;
+     
+     const naturalBalance = computeNaturalBalance(entry, group);
+     if (naturalBalance < -0.01) {
+         findings.push({
+             companyId,
+             period,
+             severity: group === 'Ativo Financeiro' ? 'critical' : 'moderate',
+             category: 'Saldo Invertido no Balancete',
+             accountsInvolved: [entry.accountCode],
+             description: `A conta ${entry.accountCode} (${entry.accountDescription}) encerrou o período com saldo invertido (contra a sua natureza contábil do grupo ${group}). Verifique lançamentos que negativaram a conta.`,
+             resolved: false
+         });
+     }
+  }
+
   const totalReceita = balanceteEntries.filter(e => accountGroups.get(e.accountCode) === 'Receita').reduce((acc, e) => acc + e.credit - e.debit, 0);
   
   const totalCaixaBancoIn = razaoEntries
@@ -796,6 +826,7 @@ Sua tarefa é fazer uma varredura completa e identificar inconsistências, tais 
 3. Valor incoerente ou atípico.
 4. Lançamento que deveria existir em outra conta e não existe.
 5. Inconsistências ou falta de lançamentos relacionados ao CMV (Custo da Mercadoria Vendida) ou contas de Resultado.
+6. Saldo de contas de disponibilidades (Caixa/Bancos, grupo 1.1.1) ficando negativo.
 
 Retorne um JSON com os achados:
 {
