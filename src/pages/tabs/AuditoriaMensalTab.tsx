@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { db, type AuditFinding, type LedgerEntry, type Account } from '../../lib/db';
 import { parseFileToData } from '../../lib/fileParser';
-import { parseLedgerData, runDeterministicAudit, runAIAudit, runFullAIAudit } from '../../lib/auditEngine';
+import { parseLedgerData, runDeterministicAudit, runBalanceteAudit, runAIAudit, runFullAIAudit } from '../../lib/auditEngine';
 import { Button } from '../../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../../components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
@@ -80,13 +80,22 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
     if (!period) return;
     setLoading(true);
     try {
-      setProgressText('Executando motor determinístico...');
+      setProgressText('Auditando balancete (checagens estruturais)...');
       // Clear old findings
       await db.auditFindings
         .where('companyId').equals(companyId)
         .and(f => f.period === period && !f.category.startsWith('Varredura Completa'))
         .delete();
-        
+
+      // Motor rápido e gratuito: roda só em cima do balancete (fecha antes de
+      // qualquer coisa que dependa do razão, e funciona mesmo que o usuário
+      // ainda não tenha subido o razão).
+      const balanceteFindings = await runBalanceteAudit(companyId, period);
+      if (balanceteFindings.length > 0) {
+        await db.auditFindings.bulkAdd(balanceteFindings);
+      }
+
+      setProgressText('Executando motor determinístico...');
       const { findings: deterministicFindings, unmatchedPool } = await runDeterministicAudit(companyId, period);
       if (deterministicFindings.length > 0) {
         await db.auditFindings.bulkAdd(deterministicFindings);
@@ -485,4 +494,3 @@ export default function AuditoriaMensalTab({ companyId }: { companyId: number })
     </div>
   );
 }
-
