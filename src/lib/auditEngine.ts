@@ -140,21 +140,80 @@ export async function parseLedgerData(
     } else if (Array.isArray(row)) {
        // Fallback positional
        if (source === 'balancete') {
-         if (row.length >= 7 && String(row[3]).match(/[\d.,]+[DC]?/i)) {
-             // Formato: Código | Classificação | Descrição | Saldo Ant | Débito | Crédito | Saldo Atual
-             accountCode = String(row[0] || '').trim();
-             accountDescription = String(row[2] || '').trim();
-             previousBalance = parseAmount(row[3]);
-             debit = parseAmount(row[4]);
-             credit = parseAmount(row[5]);
-             currentBalance = parseAmount(row[6]);
-         } else {
-             accountCode = String(row[0] || '');
-             accountDescription = String(row[1] || '');
-             previousBalance = parseAmount(row[2]);
-             debit = parseAmount(row[3]);
-             credit = parseAmount(row[4]);
-             currentBalance = parseAmount(row[5]);
+         const cleanRow = row.map((v: any) => String(v ?? '').trim()).filter((v: string) => v !== '');
+
+         const CODE_RE = /^\d+$/;
+         const CLASS_RE = /^\d+(\.\d+)*$/;
+         const MONEY_RE = /^-?\d{1,3}(\.\d{3})*,\d{2}[DC]?$/i;
+
+         // Linhas de recapitulação ("TOTAL ATIVO", "TOTAL PASSIVO...") ficam em
+         // uma linha própria, geralmente logo ABAIXO da linha de dados que elas
+         // rotulam (que repete o código de uma conta sintética já lançada antes
+         // — ex: "1" para ATIVO). Detectamos olhando a linha seguinte.
+         const nextRawClean = Array.isArray(rawData[i + 1])
+           ? (rawData[i + 1] as any[]).map((v: any) => String(v ?? '').trim()).filter((v: string) => v !== '')
+           : [];
+         const isFollowedByTotalLabel = nextRawClean.length > 0 &&
+           nextRawClean.every((v: string) => v.toUpperCase() === 'TOTAL' || v.toUpperCase().startsWith('TOTAL '));
+         const isTotalRecapRow = isFollowedByTotalLabel ||
+           cleanRow.some((v: string) => v.toUpperCase() === 'TOTAL' || v.toUpperCase().startsWith('TOTAL '));
+
+         // Detecção por conteúdo: Código (inteiro) + Classificação (numérica/hierárquica)
+         // seguidos de até 4 valores monetários — em vez de confiar em posição fixa.
+         // Necessário porque alguns geradores de balancete em PDF não desenham as
+         // colunas na ordem visual da esquerda para a direita, e a descrição da
+         // conta costuma aparecer numa linha própria, separada da linha de dados.
+         if (!isTotalRecapRow && cleanRow.length >= 2 && CODE_RE.test(cleanRow[0]) && CLASS_RE.test(cleanRow[1])) {
+           const rest = cleanRow.slice(2);
+           const moneyTokens = rest.filter((v: string) => MONEY_RE.test(v));
+           const textTokens = rest.filter((v: string) => !MONEY_RE.test(v));
+
+           let description = textTokens.join(' ').trim();
+           if (!description) {
+             // A descrição normalmente vem na linha seguinte (rótulo isolado,
+             // sem código/classificação e sem valores monetários).
+             const nextIsAnotherDataRow = nextRawClean.length >= 2 && CODE_RE.test(nextRawClean[0]) && CLASS_RE.test(nextRawClean[1]);
+             const nextHasMoney = nextRawClean.some((v: string) => MONEY_RE.test(v));
+             if (nextRawClean.length > 0 && !nextIsAnotherDataRow && !nextHasMoney) {
+               description = nextRawClean.join(' ').trim();
+             }
+           }
+
+           accountCode = cleanRow[0];
+           accountDescription = description;
+           previousBalance = parseAmount(moneyTokens[0]);
+           debit = parseAmount(moneyTokens[1]);
+           credit = parseAmount(moneyTokens[2]);
+           currentBalance = parseAmount(moneyTokens[3]);
+         } else if (!isTotalRecapRow) {
+           // Formato antigo (posicional), mantido para planilhas/CSVs onde as
+           // colunas já vêm na ordem correta.
+           if (row.length >= 7 && String(row[3]).match(/[\d.,]+[DC]?/i)) {
+               // Formato: Código | Classificação | Descrição | Saldo Ant | Débito | Crédito | Saldo Atual
+               accountCode = String(row[0] || '').trim();
+               accountDescription = String(row[2] || '').trim();
+               previousBalance = parseAmount(row[3]);
+               debit = parseAmount(row[4]);
+               credit = parseAmount(row[5]);
+               currentBalance = parseAmount(row[6]);
+           } else {
+               accountCode = String(row[0] || '');
+               accountDescription = String(row[1] || '');
+               previousBalance = parseAmount(row[2]);
+               debit = parseAmount(row[3]);
+               credit = parseAmount(row[4]);
+               currentBalance = parseAmount(row[5]);
+           }
+         }
+
+         // Linhas só de texto (rótulos de grupo como "ATIVO", "CAIXA", que aparecem
+         // soltas em sua própria linha) não têm um código de conta numérico de
+         // verdade — sem essa validação, o rótulo inteiro vira "accountCode" por
+         // engano e gera contas fantasmas. Código de balancete é sempre numérico.
+         // Exige também pelo menos 2 tokens (evita capturar números soltos do
+         // cabeçalho repetido em cada página, como o CNPJ "0001").
+         if (!CODE_RE.test(accountCode) || cleanRow.length < 2) {
+           accountCode = '';
          }
        } else {
          // Razão

@@ -51,19 +51,28 @@ async function parsePdf(file: File): Promise<any[]> {
     const page = await pdf.getPage(i);
     const textContent = await page.getTextContent();
     let currentY = -1;
-    let currentRow: string[] = [];
-    
+    let currentRow: { str: string; x: number }[] = [];
+
+    const flushRow = () => {
+      if (currentRow.length === 0) return;
+      // Itens de um mesmo PDF nem sempre chegam no fluxo de texto na ordem
+      // visual da esquerda para a direita (alguns geradores de relatório
+      // desenham colunas numéricas fora de ordem). Ordenar por X garante que
+      // a ordem das colunas bata com a ordem visual/impressa da tabela.
+      const sorted = [...currentRow].sort((a, b) => a.x - b.x);
+      const values = sorted.map(t => t.str).filter(s => s.trim() !== '');
+      if (values.length > 0) lines.push(values);
+    };
+
     for (const item of textContent.items as any[]) {
       if (currentY !== item.transform[5] && currentRow.length > 0) {
-        lines.push(currentRow);
+        flushRow();
         currentRow = [];
-        currentY = item.transform[5];
       }
-      currentRow.push(item.str);
+      currentRow.push({ str: item.str, x: item.transform[4] });
+      currentY = item.transform[5];
     }
-    if (currentRow.length > 0) {
-      lines.push(currentRow);
-    }
+    flushRow();
   }
 
   return lines;
